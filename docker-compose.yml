@@ -1,0 +1,166 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: task_manager_db
+    environment:
+      POSTGRES_USER: taskuser
+      POSTGRES_PASSWORD: taskpassword
+      POSTGRES_DB: taskmanager
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskuser -d taskmanager"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - task_network
+
+  # Redis for background task queue (optional but recommended)
+  redis:
+    image: redis:7-alpine
+    container_name: task_manager_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - task_network
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task_manager_api
+    environment:
+      # Database configuration
+      DATABASE_URL: postgresql+asyncpg://taskuser:taskpassword@db:5432/taskmanager
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_NAME: taskmanager
+      DATABASE_USER: taskuser
+      DATABASE_PASSWORD: taskpassword
+      
+      # Redis configuration
+      REDIS_URL: redis://redis:6379/0
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      
+      # Application configuration
+      ENVIRONMENT: development
+      DEBUG: "true"
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      
+      # Security
+      SECRET_KEY: your-secret-key-change-in-production
+      
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app:ro  # Mount source code for development
+      - ./tests:/app/tests:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - task_network
+    restart: unless-stopped
+
+  # Background Worker (for processing tasks)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task_manager_worker
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://taskuser:taskpassword@db:5432/taskmanager
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+    volumes:
+      - ./app:/app/app:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    networks:
+      - task_network
+    restart: unless-stopped
+
+  # Database migrations
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task_manager_migrations
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://taskuser:taskpassword@db:5432/taskmanager
+    volumes:
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
+      - ./app:/app/app:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - task_network
+    restart: "no"
+
+  # pgAdmin for database management (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: task_manager_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@taskmanager.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    networks:
+      - task_network
+    profiles:
+      - tools  # Only start with: docker-compose --profile tools up
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  task_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
